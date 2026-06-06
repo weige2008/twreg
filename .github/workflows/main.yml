@@ -1,0 +1,149 @@
+name: Twitch CDK Registration
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_count:
+        description: 'GitHub Actions 并发 job 数量 (REG_THREADS)'
+        required: true
+        type: string
+      register_count:
+        description: '每个 job 注册的账户数 (REGISTER_COUNT)'
+        required: true
+        type: string
+      failure_threshold:
+        description: '当累计失败达到该值时取消剩余任务 (FAILURE_THRESHOLD)'
+        required: false
+        type: string
+        default: '2'
+
+jobs:
+  # 首先读取配置文件
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      job-count: ${{ steps.config.outputs.job-count }}
+      register-count: ${{ steps.config.outputs.register-count }}
+      job-indices: ${{ steps.config.outputs.job-indices }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read parameters and parse job matrix
+        id: config
+        run: |
+          JOB_COUNT="${{ github.event.inputs.job_count }}"
+          REGISTER_COUNT="${{ github.event.inputs.register_count }}"
+          
+          # 验证数值
+          if ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -lt 1 ]; then
+            echo "Error: Invalid JOB_COUNT ($JOB_COUNT)"
+            exit 1
+          fi
+          if ! [[ "$REGISTER_COUNT" =~ ^[0-9]+$ ]] || [ "$REGISTER_COUNT" -lt 1 ]; then
+            echo "Error: Invalid REGISTER_COUNT ($REGISTER_COUNT)"
+            exit 1
+          fi
+          
+          echo "job-count=${JOB_COUNT}" >> $GITHUB_OUTPUT
+          echo "register-count=${REGISTER_COUNT}" >> $GITHUB_OUTPUT
+          
+          # 生成job索引数组: [0, 1, 2, ...] (使用JSON格式)
+          INDICES=$(python3 -c "import json; print(json.dumps(list(range(int('$JOB_COUNT')))))")
+          echo "job-indices=${INDICES}" >> $GITHUB_OUTPUT
+
+  # 并发执行多个job
+  register:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        job-index: ${{ fromJson(needs.prepare.outputs.job-indices) }}
+      fail-fast: false
+      max-parallel: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 libnspr4 libnss3 \
+            libasound2t64 libxshmfence1 libx11-xcb1 libxcb-dri3-0 \
+            libxfixes3 libxext6 libxinerama1 \
+            fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+            fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf \
+            xvfb
+
+      - name: Install Python dependencies
+        run: |
+          cd reg_linux
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run registration (Job ${{ matrix.job-index }})
+        run: |
+          export WORKER_ID="reg_job_${{ matrix.job-index }}_${{ github.run_id }}"
+          export LOGURU_LEVEL=INFO
+          python3 -m reg_linux.main
+        env:
+          TWITCH_CTF: "1"
+          REGISTER_COUNT: ${{ needs.prepare.outputs.register-count }}
+          FAILURE_THRESHOLD: ${{ github.event.inputs.failure_threshold }}
+
+      - name: Upload logs
+        if: always()
+        run: |
+          set -e
+          ART_DIR="artifacts/job-${{ matrix.job-index }}"
+          mkdir -p "$ART_DIR"
+          # copy logs (if any)
+          cp reg_linux/reg_linux_*.log "$ART_DIR/" 2>/dev/null || true
+          # copy screenshots and profiles folder (if any)
+          if [ -d "reg_linux/profiles" ]; then
+            cp -r reg_linux/profiles "$ART_DIR/" || true
+          fi
+          if [ -d "profiles" ]; then
+            cp -r profiles "$ART_DIR/" || true
+          fi
+          # include any other debug files
+          cp -r reg_linux/*.log "$ART_DIR/" 2>/dev/null || true
+          # create compressed package
+          TAR_PATH="artifacts/job-${{ matrix.job-index }}.tar.gz"
+          tar -czf "$TAR_PATH" -C artifacts "job-${{ matrix.job-index }}"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-${{ matrix.job-index }}-artifacts
+          path: artifacts/job-${{ matrix.job-index }}.tar.gz
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # 汇总结果
+  summary:
+    needs: [prepare, register]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all logs
+        uses: actions/download-artifact@v4
+        with:
+          path: logs
+
+      - name: Show summary
+        run: |
+          echo "Workflow completed."
+          echo "Job count: ${{ needs.prepare.outputs.job-count }}"
+          echo "Register count: ${{ needs.prepare.outputs.register-count }}"
