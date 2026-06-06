@@ -1,29 +1,42 @@
-name: Twitch CDK Registration
+name: Auto Registration Runner
 
 on:
   workflow_dispatch:
     inputs:
+      front_ip:
+        description: 'Front server IP (FRONT_IP)'
+        required: true
+        type: string
+        default: '198.44.182.21'
       job_count:
-        description: 'GitHub Actions 并发 job 数量 (REG_THREADS)'
+        description: 'Concurrent job count (REG_THREADS)'
         required: true
         type: string
+        default: '256'
       register_count:
-        description: '每个 job 注册的账户数 (REGISTER_COUNT)'
+        description: 'Accounts per job (REGISTER_COUNT)'
         required: true
         type: string
+        default: '20'
       failure_threshold:
-        description: '当累计失败达到该值时取消剩余任务 (FAILURE_THRESHOLD)'
+        description: 'Cancel remaining tasks when failures reach this (FAILURE_THRESHOLD)'
         required: false
         type: string
         default: '2'
+      mail_domains:
+        description: 'Temp email domain for registration (MAIL_DOMAINS)'
+        required: false
+        type: string
+        default: 'olsbvgq.shop'
 
 jobs:
-  # 首先读取配置文件
   prepare:
     runs-on: ubuntu-latest
     outputs:
+      front-ip: ${{ steps.config.outputs.front-ip }}
       job-count: ${{ steps.config.outputs.job-count }}
       register-count: ${{ steps.config.outputs.register-count }}
+      mail-domains: ${{ steps.config.outputs.mail-domains }}
       job-indices: ${{ steps.config.outputs.job-indices }}
     steps:
       - name: Checkout code
@@ -32,27 +45,31 @@ jobs:
       - name: Read parameters and parse job matrix
         id: config
         run: |
+          FRONT_IP_VAL="${{ github.event.inputs.front_ip }}"
           JOB_COUNT="${{ github.event.inputs.job_count }}"
-          REGISTER_COUNT="${{ github.event.inputs.register_count }}"
+          REG_COUNT="${{ github.event.inputs.register_count }}"
           
-          # 验证数值
+          if [ -z "$FRONT_IP_VAL" ]; then
+            echo "Error: FRONT_IP is required"
+            exit 1
+          fi
           if ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -lt 1 ]; then
             echo "Error: Invalid JOB_COUNT ($JOB_COUNT)"
             exit 1
           fi
-          if ! [[ "$REGISTER_COUNT" =~ ^[0-9]+$ ]] || [ "$REGISTER_COUNT" -lt 1 ]; then
-            echo "Error: Invalid REGISTER_COUNT ($REGISTER_COUNT)"
+          if ! [[ "$REG_COUNT" =~ ^[0-9]+$ ]] || [ "$REG_COUNT" -lt 1 ]; then
+            echo "Error: Invalid REGISTER_COUNT ($REG_COUNT)"
             exit 1
           fi
           
+          echo "front-ip=${FRONT_IP_VAL}" >> $GITHUB_OUTPUT
           echo "job-count=${JOB_COUNT}" >> $GITHUB_OUTPUT
-          echo "register-count=${REGISTER_COUNT}" >> $GITHUB_OUTPUT
+          echo "register-count=${REG_COUNT}" >> $GITHUB_OUTPUT
+          echo "mail-domains=${{ github.event.inputs.mail_domains || 'htazmbb.shop' }}" >> $GITHUB_OUTPUT
           
-          # 生成job索引数组: [0, 1, 2, ...] (使用JSON格式)
           INDICES=$(python3 -c "import json; print(json.dumps(list(range(int('$JOB_COUNT')))))")
           echo "job-indices=${INDICES}" >> $GITHUB_OUTPUT
 
-  # 并发执行多个job
   register:
     needs: prepare
     runs-on: ubuntu-latest
@@ -71,6 +88,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: linux/req.txt
 
       - name: Install system dependencies
         run: |
@@ -87,19 +105,21 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          cd reg_linux
+          cd linux
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r req.txt
 
       - name: Run registration (Job ${{ matrix.job-index }})
         run: |
-          export WORKER_ID="reg_job_${{ matrix.job-index }}_${{ github.run_id }}"
+          export WORKER_ID="wrk_job_${{ matrix.job-index }}_${{ github.run_id }}"
           export LOGURU_LEVEL=INFO
-          python3 -m reg_linux.main
+          python3 -m linux
         env:
           TWITCH_CTF: "1"
+          FRONT_IP: ${{ needs.prepare.outputs.front-ip }}
           REGISTER_COUNT: ${{ needs.prepare.outputs.register-count }}
           FAILURE_THRESHOLD: ${{ github.event.inputs.failure_threshold }}
+          MAIL_DOMAINS: ${{ needs.prepare.outputs.mail-domains }}
 
       - name: Upload logs
         if: always()
@@ -107,18 +127,14 @@ jobs:
           set -e
           ART_DIR="artifacts/job-${{ matrix.job-index }}"
           mkdir -p "$ART_DIR"
-          # copy logs (if any)
-          cp reg_linux/reg_linux_*.log "$ART_DIR/" 2>/dev/null || true
-          # copy screenshots and profiles folder (if any)
-          if [ -d "reg_linux/profiles" ]; then
-            cp -r reg_linux/profiles "$ART_DIR/" || true
+          cp linux/reg_linux_*.log "$ART_DIR/" 2>/dev/null || true
+          if [ -d "linux/profiles" ]; then
+            cp -r linux/profiles "$ART_DIR/" || true
           fi
           if [ -d "profiles" ]; then
             cp -r profiles "$ART_DIR/" || true
           fi
-          # include any other debug files
-          cp -r reg_linux/*.log "$ART_DIR/" 2>/dev/null || true
-          # create compressed package
+          cp -r linux/*.log "$ART_DIR/" 2>/dev/null || true
           TAR_PATH="artifacts/job-${{ matrix.job-index }}.tar.gz"
           tar -czf "$TAR_PATH" -C artifacts "job-${{ matrix.job-index }}"
 
@@ -131,7 +147,6 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # 汇总结果
   summary:
     needs: [prepare, register]
     runs-on: ubuntu-latest
@@ -144,6 +159,8 @@ jobs:
 
       - name: Show summary
         run: |
-          echo "Workflow completed."
+          echo "Completed."
+          echo "Front: ${{ needs.prepare.outputs.front-ip }}"
           echo "Job count: ${{ needs.prepare.outputs.job-count }}"
           echo "Register count: ${{ needs.prepare.outputs.register-count }}"
+          echo "Mail domains: ${{ needs.prepare.outputs.mail-domains }}"
